@@ -10,14 +10,14 @@ interface VerdictCardProps {
 
 export const VerdictCard: React.FC<VerdictCardProps> = ({ verdict, plaintiff, defendant, onReset }) => {
   return (
-    <div className="w-full max-w-4xl bg-white rounded-3xl shadow-2xl overflow-hidden border-4 border-orange-200 mb-12">
+    <div className="w-full max-w-4xl bg-white rounded-3xl shadow-2xl overflow-hidden border-4 border-orange-200 mb-12 animate-fadeIn">
       {/* Header */}
       <div className="bg-slate-800 p-8 text-center relative overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-full opacity-10 bg-[url('https://www.transparenttextures.com/patterns/cubes.png')]"></div>
         <div className="relative z-10">
           <span className="text-6xl block mb-2">🧑‍⚖️😺</span>
           <h2 className="text-3xl md:text-4xl font-bold text-orange-100 font-serif">猫猫法庭最终判决</h2>
-          <p className="text-slate-400 mt-2">案件编号: MEOW-{Math.floor(Math.random() * 10000)}</p>
+          <p className="text-slate-400 mt-2">案件已归档</p>
         </div>
       </div>
 
@@ -80,12 +80,14 @@ export const VerdictCard: React.FC<VerdictCardProps> = ({ verdict, plaintiff, de
           <p className="text-2xl font-serif text-slate-800 font-bold">{verdict.reconciliationRitual}</p>
         </div>
 
-        <button
-          onClick={onReset}
-          className="w-full py-4 bg-slate-800 text-orange-50 font-bold rounded-xl hover:bg-slate-900 transition shadow-lg"
-        >
-          开始新的审判 (New Case)
-        </button>
+        <div className="text-center pt-8">
+          <button
+            onClick={onReset}
+            className="px-8 py-4 bg-slate-800 text-orange-50 font-bold rounded-xl hover:bg-slate-900 transition shadow-lg"
+          >
+            退出法庭 (Close Case)
+          </button>
+        </div>
       </div>
     </div>
   );

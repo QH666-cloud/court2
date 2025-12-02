@@ -50,6 +50,7 @@ export const getJudgeVerdict = async (
 ): Promise<VerdictData> => {
   const apiKey = process.env.API_KEY;
   if (!apiKey) {
+    // This specific error string triggers the UI guide in App.tsx
     throw new Error("Missing API Key");
   }
 
@@ -72,6 +73,8 @@ export const getJudgeVerdict = async (
     Be fair. Even if one person seems more wrong, try to find the nuance. 
     Your tone should be authoritative but cute (use 'Meow', 'Purr', etc., occasionally).
     However, the advice should be genuinely helpful for their relationship.
+    
+    IMPORTANT: Respond in CHINESE (Simplified).
   `;
 
   try {
@@ -81,7 +84,7 @@ export const getJudgeVerdict = async (
       config: {
         responseMimeType: "application/json",
         responseSchema: verdictSchema,
-        systemInstruction: "You are an AI Cat Judge helping couples resolve arguments.",
+        systemInstruction: "You are an AI Cat Judge helping couples resolve arguments. Respond in Chinese.",
       },
     });
 
@@ -90,8 +93,10 @@ export const getJudgeVerdict = async (
     } else {
       throw new Error("The Cat Judge was silent (No response text).");
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Judgement Error:", error);
-    throw new Error("The Cat Judge is currently napping. Please try again later.");
+    // Re-throw if it's our specific key error, otherwise generic
+    if (error.message === "Missing API Key") throw error;
+    throw new Error("猫猫法官正在午睡 (服务连接失败，请检查网络或 Key).");
   }
 };

@@ -1,10 +1,8 @@
 // types.ts
 
 export enum AppStep {
-  LANDING = 'LANDING',
-  PLAINTIFF_INPUT = 'PLAINTIFF_INPUT', // 原告 (User A)
-  SHARE_WAIT = 'SHARE_WAIT', // Generating link / Passing device
-  DEFENDANT_INPUT = 'DEFENDANT_INPUT', // 被告 (User B)
+  LOGIN = 'LOGIN', // Select Room ID and Role
+  COURT_SESSION = 'COURT_SESSION', // Both inputs happen here
   JUDGING = 'JUDGING',
   VERDICT = 'VERDICT'
 }
@@ -12,17 +10,17 @@ export enum AppStep {
 export interface LitigantData {
   name: string;
   story: string;
-  grievance: string; // The specific point of hurt/feeling
+  grievance: string;
 }
 
 export interface VerdictData {
   summary: string;
-  plaintiffFaultScore: number; // 0-100
-  defendantFaultScore: number; // 0-100
+  plaintiffFaultScore: number;
+  defendantFaultScore: number;
   verdictReasoning: string;
   plaintiffAdvice: string;
   defendantAdvice: string;
-  reconciliationRitual: string; // A cute task for them to do
+  reconciliationRitual: string;
 }
 
 export interface CaseState {
@@ -31,4 +29,13 @@ export interface CaseState {
   defendant: LitigantData;
   verdict: VerdictData | null;
   error: string | null;
+  roomId: string;
+  role: 'PLAINTIFF' | 'DEFENDANT' | null;
+  isConnected: boolean;
 }
+
+// P2P Message Types
+export type SyncMessage = 
+  | { type: 'SYNC_DATA'; payload: { role: 'PLAINTIFF' | 'DEFENDANT'; data: LitigantData } }
+  | { type: 'SYNC_VERDICT'; payload: VerdictData }
+  | { type: 'TRIGGER_JUDGEMENT_START' };

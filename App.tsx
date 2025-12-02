@@ -1,296 +1,308 @@
-import React, { useState, useEffect } from 'react';
-import { AppStep, CaseState, LitigantData, VerdictData } from './types';
+import React, { useState, useEffect, useRef } from 'react';
+import { AppStep, CaseState, LitigantData, VerdictData, SyncMessage } from './types';
 import { getJudgeVerdict } from './services/geminiService';
 import { InputCard } from './components/InputCard';
 import { VerdictCard } from './components/VerdictCard';
-
-// Helper to encode/decode state for sharing via URL
-const encodeState = (data: LitigantData): string => {
-  try {
-    const json = JSON.stringify(data);
-    return btoa(encodeURIComponent(json));
-  } catch (e) {
-    console.error("Encoding error", e);
-    return "";
-  }
-};
-
-const decodeState = (str: string): LitigantData | null => {
-  try {
-    const json = decodeURIComponent(atob(str));
-    return JSON.parse(json);
-  } catch (e) {
-    console.error("Decoding error", e);
-    return null;
-  }
-};
+import { LoginCard } from './components/LoginCard';
+import Peer, { DataConnection } from 'peerjs';
 
 const INITIAL_LITIGANT: LitigantData = { name: '', story: '', grievance: '' };
 
+// Generate Peer IDs based on Room Name to make them predictable
+const getPeerId = (roomId: string, role: 'PLAINTIFF' | 'DEFENDANT') => {
+  // Simple sanitation
+  const cleanRoom = roomId.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+  return `cat-court-${cleanRoom}-${role.toLowerCase()}`;
+};
+
 const App: React.FC = () => {
   const [state, setState] = useState<CaseState>({
-    step: AppStep.LANDING,
+    step: AppStep.LOGIN,
     plaintiff: { ...INITIAL_LITIGANT },
     defendant: { ...INITIAL_LITIGANT },
     verdict: null,
     error: null,
+    roomId: '',
+    role: null,
+    isConnected: false
   });
 
-  // Check URL on load for shared case data
+  const peerRef = useRef<Peer | null>(null);
+  const connRef = useRef<DataConnection | null>(null);
+
+  // Cleanup on unmount
   useEffect(() => {
-    const hash = window.location.hash;
-    if (hash.startsWith('#/share/')) {
-      const encodedData = hash.replace('#/share/', '');
-      const decodedPlaintiff = decodeState(encodedData);
-      if (decodedPlaintiff) {
-        setState(prev => ({
-          ...prev,
-          plaintiff: decodedPlaintiff,
-          step: AppStep.DEFENDANT_INPUT
-        }));
-        // Clean URL
-        window.history.replaceState(null, '', window.location.pathname);
-      }
-    }
+    return () => {
+      if (peerRef.current) peerRef.current.destroy();
+    };
   }, []);
 
-  const handleStart = () => {
-    setState(prev => ({ ...prev, step: AppStep.PLAINTIFF_INPUT }));
+  // --- P2P Logic ---
+
+  const handleJoinRoom = (roomId: string, role: 'PLAINTIFF' | 'DEFENDANT') => {
+    setState(prev => ({ ...prev, roomId, role, error: null }));
+
+    const myId = getPeerId(roomId, role);
+    const targetId = getPeerId(roomId, role === 'PLAINTIFF' ? 'DEFENDANT' : 'PLAINTIFF');
+
+    console.log(`Initializing Peer: ${myId}`);
+
+    const peer = new Peer(myId);
+    peerRef.current = peer;
+
+    peer.on('open', (id) => {
+      console.log('My Peer ID is: ' + id);
+      
+      if (role === 'PLAINTIFF') {
+        // Plaintiff waits for connection
+        peer.on('connection', (conn) => {
+           setupConnection(conn);
+        });
+      } else {
+        // Defendant initiates connection
+        console.log(`Connecting to: ${targetId}`);
+        const conn = peer.connect(targetId);
+        setupConnection(conn);
+      }
+    });
+
+    peer.on('error', (err) => {
+      console.error(err);
+      let errorMsg = "Connection Error.";
+      if (err.type === 'unavailable-id') {
+        errorMsg = "该房间/角色已被占用 (Room ID taken).";
+        if (role === 'PLAINTIFF') errorMsg += " 尝试换个房间号，或者对方已经是原告了。";
+        if (role === 'DEFENDANT') errorMsg += " 请检查原告是否已创建房间，或尝试换个房间号。";
+      }
+      setState(prev => ({ ...prev, error: errorMsg, isConnected: false }));
+    });
   };
 
-  const updatePlaintiff = (field: keyof LitigantData, value: string) => {
+  const setupConnection = (conn: DataConnection) => {
+    conn.on('open', () => {
+      console.log("Connected to peer!");
+      connRef.current = conn;
+      setState(prev => ({ ...prev, isConnected: true, step: AppStep.COURT_SESSION }));
+      
+      // Send initial state to sync
+      sendSyncMessage({ 
+        type: 'SYNC_DATA', 
+        payload: { 
+          role: state.role!, // we know role is set here
+          data: state.role === 'PLAINTIFF' ? state.plaintiff : state.defendant 
+        } 
+      });
+    });
+
+    conn.on('data', (data: any) => {
+      handleIncomingMessage(data as SyncMessage);
+    });
+
+    conn.on('close', () => {
+      alert("对方已断开连接 (Peer disconnected)");
+      setState(prev => ({ ...prev, isConnected: false }));
+    });
+    
+    conn.on('error', (err) => {
+      console.error("Connection Error", err);
+    });
+  };
+
+  const sendSyncMessage = (msg: SyncMessage) => {
+    if (connRef.current && connRef.current.open) {
+      connRef.current.send(msg);
+    }
+  };
+
+  const handleIncomingMessage = (msg: SyncMessage) => {
+    if (msg.type === 'SYNC_DATA') {
+      const { role, data } = msg.payload;
+      setState(prev => ({
+        ...prev,
+        [role.toLowerCase()]: data
+      }));
+    } else if (msg.type === 'SYNC_VERDICT') {
+      setState(prev => ({
+        ...prev,
+        verdict: msg.payload,
+        step: AppStep.VERDICT
+      }));
+    } else if (msg.type === 'TRIGGER_JUDGEMENT_START') {
+       setState(prev => ({ ...prev, step: AppStep.JUDGING }));
+    }
+  };
+
+  // --- Input Handlers ---
+
+  const handleDataChange = (field: keyof LitigantData, value: string) => {
+    if (!state.role) return;
+    
+    const myRoleKey = state.role === 'PLAINTIFF' ? 'plaintiff' : 'defendant';
+    const newData = { ...state[myRoleKey], [field]: value };
+    
+    // Update local state
     setState(prev => ({
       ...prev,
-      plaintiff: { ...prev.plaintiff, [field]: value }
+      [myRoleKey]: newData
     }));
+
+    // Broadcast to peer
+    sendSyncMessage({
+      type: 'SYNC_DATA',
+      payload: { role: state.role, data: newData }
+    });
   };
 
-  const updateDefendant = (field: keyof LitigantData, value: string) => {
-    setState(prev => ({
-      ...prev,
-      defendant: { ...prev.defendant, [field]: value }
-    }));
-  };
+  const handleSubmitJudgement = async () => {
+    if (!state.plaintiff.name || !state.plaintiff.story || !state.defendant.name || !state.defendant.story) {
+       alert("请等待双方都填写完毕 (Both sides must finish)");
+       return;
+    }
 
-  const handlePlaintiffSubmit = () => {
-    setState(prev => ({ ...prev, step: AppStep.SHARE_WAIT }));
-  };
-
-  const handleDefendantSubmit = async () => {
     setState(prev => ({ ...prev, step: AppStep.JUDGING }));
+    sendSyncMessage({ type: 'TRIGGER_JUDGEMENT_START' });
+
     try {
+      // Only the person who clicked needs to call API, then sync result
       const verdict = await getJudgeVerdict(state.plaintiff, state.defendant);
+      
       setState(prev => ({ ...prev, verdict, step: AppStep.VERDICT }));
+      sendSyncMessage({ type: 'SYNC_VERDICT', payload: verdict });
+      
     } catch (error: any) {
       setState(prev => ({ 
         ...prev, 
-        step: AppStep.DEFENDANT_INPUT, 
-        error: error.message || "Something went wrong" 
+        step: AppStep.COURT_SESSION, 
+        error: error.message 
       }));
     }
   };
 
-  const copyShareLink = () => {
-    const encoded = encodeState(state.plaintiff);
-    const url = `${window.location.origin}${window.location.pathname}#/share/${encoded}`;
-    navigator.clipboard.writeText(url).then(() => {
-      alert("链接已复制！发送给对方，让他在他的设备上填写。");
-    }).catch(() => {
-      alert("复制失败，请手动复制地址栏（如果是通过地址栏传递的话）");
-    });
-  };
-
-  const continueOnSameDevice = () => {
-     setState(prev => ({ ...prev, step: AppStep.DEFENDANT_INPUT }));
-  };
-
   const handleReset = () => {
-    setState({
-      step: AppStep.LANDING,
-      plaintiff: { ...INITIAL_LITIGANT },
-      defendant: { ...INITIAL_LITIGANT },
-      verdict: null,
-      error: null
-    });
-    window.location.hash = '';
+    if (peerRef.current) peerRef.current.destroy();
+    window.location.reload();
   };
 
-  // Render Helpers
-  const renderContent = () => {
-    switch (state.step) {
-      case AppStep.LANDING:
-        return (
-          <div className="text-center space-y-8 max-w-2xl mx-auto px-6">
-            <div className="mb-8 relative inline-block">
-              <div className="absolute inset-0 bg-orange-200 rounded-full blur-2xl opacity-50 animate-pulse"></div>
-              <img 
-                src="https://picsum.photos/seed/catjudge1/300/300" 
-                alt="Cat Judge" 
-                className="w-48 h-48 md:w-64 md:h-64 rounded-full border-8 border-white shadow-2xl mx-auto relative z-10 object-cover"
-              />
-              <div className="absolute -bottom-4 -right-4 text-6xl">⚖️</div>
-            </div>
-            
-            <h1 className="text-5xl md:text-7xl font-bold text-orange-900 font-serif tracking-tight">
-              猫猫法庭
-            </h1>
-            <p className="text-xl text-orange-800/80 font-medium">
-              Cat Court: 公正、可爱、绝不偏袒（除非你有小鱼干）
-            </p>
-            
-            <div className="bg-white/80 backdrop-blur-sm p-6 rounded-2xl shadow-lg border border-orange-100 text-left space-y-4">
-              <h3 className="font-bold text-lg text-orange-900">📝 如何使用：</h3>
-              <ul className="space-y-2 text-slate-700">
-                <li className="flex items-start"><span className="mr-2">1.</span> <span>一方（原告）先陈述自己的委屈。</span></li>
-                <li className="flex items-start"><span className="mr-2">2.</span> <span>将“传票”（链接）发给另一方，或者直接递交设备。</span></li>
-                <li className="flex items-start"><span className="mr-2">3.</span> <span>另一方（被告）进行陈述。</span></li>
-                <li className="flex items-start"><span className="mr-2">4.</span> <span>猫猫法官 AI 进行裁决并给出和解方案。</span></li>
-              </ul>
-            </div>
+  // --- Render ---
 
-            <button 
-              onClick={handleStart}
-              className="bg-orange-600 hover:bg-orange-700 text-white text-xl font-bold py-4 px-12 rounded-full shadow-xl transition-transform hover:scale-105 active:scale-95"
-            >
-              👩‍⚖️ 开庭 (Start Case)
-            </button>
+  // Vercel Key Error
+  if (state.error === "Missing API Key") {
+    return (
+      <div className="min-h-screen bg-[#FFF8F0] flex items-center justify-center p-4">
+        <div className="max-w-xl w-full bg-white rounded-2xl shadow-2xl p-8 border-l-8 border-red-500">
+           <h1 className="text-2xl font-bold text-red-600 mb-4">配置缺失</h1>
+           <p className="text-slate-700 mb-4">请在Vercel后台配置 <code>API_KEY</code> 环境变量。</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-[#FFF8F0] flex flex-col items-center py-8 px-4 md:px-8">
+      
+      {/* Navbar */}
+      <div className="w-full max-w-6xl flex justify-between items-center mb-8 px-4">
+        <div className="flex items-center gap-2">
+            <span className="text-3xl">🐱</span>
+            <span className="font-bold text-orange-900 font-serif text-xl">猫猫法庭</span>
+        </div>
+        {state.roomId && (
+          <div className="flex gap-2">
+            <span className="bg-orange-100 text-orange-800 px-3 py-1 rounded-full text-xs font-bold border border-orange-200">
+              Room: {state.roomId}
+            </span>
+            {state.isConnected ? (
+              <span className="bg-green-100 text-green-800 px-3 py-1 rounded-full text-xs font-bold border border-green-200">
+                ● 已连接
+              </span>
+            ) : (
+              state.step !== AppStep.LOGIN && (
+                <span className="bg-yellow-100 text-yellow-800 px-3 py-1 rounded-full text-xs font-bold border border-yellow-200 animate-pulse">
+                  ● 等待连接...
+                </span>
+              )
+            )}
           </div>
-        );
+        )}
+      </div>
 
-      case AppStep.PLAINTIFF_INPUT:
-        return (
-          <InputCard
-            title="原告陈述"
-            role="原告 (Plaintiff)"
-            icon="😿"
-            data={state.plaintiff}
-            onChange={updatePlaintiff}
-            onSubmit={handlePlaintiffSubmit}
+      {/* Main Area */}
+      <div className="w-full flex justify-center flex-grow">
+        
+        {state.step === AppStep.LOGIN && (
+          <LoginCard 
+            onJoin={handleJoinRoom} 
+            isConnecting={!!state.role && !state.isConnected && !state.error} // Simple connecting check
+            error={state.error}
           />
-        );
+        )}
 
-      case AppStep.SHARE_WAIT:
-        return (
-          <div className="w-full max-w-xl bg-white rounded-3xl shadow-xl p-8 text-center space-y-8 border-2 border-orange-100">
-            <div className="text-6xl">📨</div>
-            <h2 className="text-3xl font-bold text-slate-800">提交成功！</h2>
-            <p className="text-slate-600">现在，我们需要听听另一方的说法。</p>
-            
-            <div className="grid gap-4">
-              <button 
-                onClick={copyShareLink}
-                className="w-full py-4 bg-blue-50 text-blue-600 font-bold rounded-xl border-2 border-blue-100 hover:bg-blue-100 transition flex items-center justify-center gap-2"
-              >
-                <span>🔗</span> 复制链接发送给对方 (远程)
-              </button>
-              
-              <div className="relative flex py-2 items-center">
-                <div className="flex-grow border-t border-slate-200"></div>
-                <span className="flex-shrink mx-4 text-slate-400 text-sm">或者</span>
-                <div className="flex-grow border-t border-slate-200"></div>
-              </div>
+        {state.step === AppStep.COURT_SESSION && (
+          <div className="w-full max-w-6xl grid grid-cols-1 md:grid-cols-2 gap-8 items-start">
+             {/* Left Column: Plaintiff */}
+             <div className="relative">
+               <InputCard 
+                 title="原告席"
+                 roleTitle="Plaintiff"
+                 icon="😿"
+                 data={state.plaintiff}
+                 onChange={(f, v) => state.role === 'PLAINTIFF' && handleDataChange(f, v)}
+                 readOnly={state.role !== 'PLAINTIFF'}
+                 isActiveUser={state.role === 'PLAINTIFF'}
+               />
+             </div>
 
-              <button 
-                onClick={continueOnSameDevice}
-                className="w-full py-4 bg-orange-600 text-white font-bold rounded-xl hover:bg-orange-700 transition shadow-md"
-              >
-                📱 把设备递给对方 (当面)
-              </button>
-            </div>
-            
-            <p className="text-xs text-slate-400 mt-4">
-              注意：如果使用链接分享，请确保生成的链接没有被截断（如果故事太长，建议使用当面模式）。
-            </p>
+             {/* Right Column: Defendant */}
+             <div className="relative">
+               <InputCard 
+                 title="被告席"
+                 roleTitle="Defendant"
+                 icon="😼"
+                 data={state.defendant}
+                 onChange={(f, v) => state.role === 'DEFENDANT' && handleDataChange(f, v)}
+                 readOnly={state.role !== 'DEFENDANT'}
+                 isActiveUser={state.role === 'DEFENDANT'}
+               />
+             </div>
+
+             {/* Submit Action Area */}
+             <div className="md:col-span-2 flex justify-center mt-8 pb-12">
+                <button
+                  onClick={handleSubmitJudgement}
+                  disabled={!state.isConnected}
+                  className="bg-orange-600 hover:bg-orange-700 disabled:bg-slate-300 text-white text-xl font-bold py-4 px-12 rounded-full shadow-xl transition-transform hover:scale-105 active:scale-95 flex items-center gap-3"
+                >
+                  <span>⚖️</span>
+                  请求判决 (Submit to Judge)
+                </button>
+             </div>
           </div>
-        );
+        )}
 
-      case AppStep.DEFENDANT_INPUT:
-        return (
-          <InputCard
-            title="被告陈述"
-            role="被告 (Defendant)"
-            icon="😼"
-            data={state.defendant}
-            onChange={updateDefendant}
-            onSubmit={handleDefendantSubmit}
-            isSubmitting={false}
-          />
-        );
-
-      case AppStep.JUDGING:
-        return (
-          <div className="text-center max-w-lg mx-auto">
-            <div className="mb-8 relative">
-              <div className="w-48 h-48 mx-auto bg-orange-100 rounded-full flex items-center justify-center animate-bounce">
-                <span className="text-8xl">⚖️</span>
-              </div>
-            </div>
+        {state.step === AppStep.JUDGING && (
+          <div className="text-center mt-20">
+            <div className="text-8xl animate-bounce mb-8">⚖️</div>
             <h2 className="text-3xl font-bold text-slate-800 mb-4">法庭正在审理中...</h2>
-            <p className="text-slate-500 animate-pulse">猫猫法官正在阅读卷宗，分析谁偷吃了更多的小鱼干...</p>
-            <div className="mt-8 flex justify-center space-x-2">
-              <div className="w-3 h-3 bg-orange-500 rounded-full animate-bounce" style={{ animationDelay: '0s' }}></div>
-              <div className="w-3 h-3 bg-orange-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
-              <div className="w-3 h-3 bg-orange-500 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></div>
-            </div>
+            <p className="text-slate-500">猫猫法官正在同步思考 (Synchronized Thinking)...</p>
           </div>
-        );
+        )}
 
-      case AppStep.VERDICT:
-        return state.verdict ? (
+        {state.step === AppStep.VERDICT && state.verdict && (
           <VerdictCard 
-            verdict={state.verdict} 
+            verdict={state.verdict}
             plaintiff={state.plaintiff}
             defendant={state.defendant}
             onReset={handleReset}
           />
-        ) : null;
-      
-      default:
-        return null;
-    }
-  };
+        )}
+      </div>
 
-  return (
-    <div className="min-h-screen bg-[#FFF8F0] flex flex-col items-center py-12 px-4 md:px-8">
-      {/* Navbar/Header Small */}
-      {state.step !== AppStep.LANDING && (
-        <div className="w-full max-w-4xl flex justify-between items-center mb-8 px-4">
-          <div className="flex items-center gap-2 cursor-pointer" onClick={handleReset}>
-             <span className="text-2xl">🐱</span>
-             <span className="font-bold text-orange-900 font-serif hidden md:block">猫猫法庭</span>
-          </div>
-          <div className="text-sm font-bold text-orange-400 bg-orange-50 px-3 py-1 rounded-full border border-orange-100">
-             {state.step === AppStep.PLAINTIFF_INPUT && '步骤 1/3'}
-             {state.step === AppStep.DEFENDANT_INPUT && '步骤 2/3'}
-             {state.step === AppStep.JUDGING && '审理中'}
-             {state.step === AppStep.VERDICT && '最终判决'}
-          </div>
+      {state.error && state.step !== AppStep.LOGIN && (
+        <div className="fixed bottom-4 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-6 py-3 rounded-full shadow-lg font-bold">
+           ⚠️ {state.error}
         </div>
       )}
 
-      {/* Error Banner */}
-      {state.error && (
-         <div className="max-w-md w-full bg-red-50 border-l-4 border-red-500 text-red-700 p-4 mb-6 rounded shadow-md" role="alert">
-            <p className="font-bold">Error</p>
-            <p>{state.error}</p>
-            <button 
-              onClick={() => setState(s => ({ ...s, error: null }))}
-              className="mt-2 text-sm underline"
-            >
-              Dismiss
-            </button>
-         </div>
-      )}
-
-      {/* Main Content Area */}
-      <div className="w-full flex justify-center">
-        {renderContent()}
-      </div>
-
-      {/* Footer */}
-      <footer className="mt-auto pt-12 text-center text-slate-400 text-sm">
-        <p>© {new Date().getFullYear()} 猫猫法庭 | Powered by Gemini 2.5</p>
-      </footer>
     </div>
   );
 };
